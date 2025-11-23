@@ -25,7 +25,8 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
-CORS(app)
+# Ajustar CORS para permitir todas las rutas y supports_credentials=True
+CORS(app, supports_credentials=True)
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(BASE_DIR, 'swapmvp.db')}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = "cambia_esto_por_un_secreto_en_produccion"
@@ -757,3 +758,87 @@ if __name__ == "__main__":
         db.create_all()
         print("B creada (swapmvp.db)")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
+# --- Trueques recibidos ---
+
+# Endpoint para obtener las solicitudes de trueque que el usuario ha recibido
+@app.route("/trade/received", methods=["GET"])
+@jwt_required()
+def received_trades():
+    """
+    Devuelve los trueques recibidos por el usuario autenticado, con:
+      - info de objeto solicitado (el del usuario destino)
+      - info de objeto ofrecido (puede ser None)
+      - info del usuario origen (el que propone)
+    """
+    uid = int(get_jwt_identity())
+    trades = Trueque.query.filter_by(usuario_destino_id=uid).order_by(Trueque.fecha_creacion.desc()).all()
+    def serialize_objeto(obj):
+        if not obj:
+            return None
+        return {
+            "id": obj.id,
+            "usuario_id": obj.usuario_id,
+            "fotos": obj.fotos_list(),
+            "titulo": obj.titulo,
+            "descripcion": obj.descripcion,
+            "categoria": obj.categoria,
+            "estado": obj.estado,
+            "fecha_creacion": obj.fecha_creacion.isoformat(),
+            "fecha_ultimo_movimiento": obj.fecha_ultimo_movimiento.isoformat(),
+            "likes": obj.likes
+        }
+    result = []
+    for t in trades:
+        obj_solicitado = Objeto.query.get(t.objeto_solicitado_id) if t.objeto_solicitado_id else None
+        obj_ofrecido = Objeto.query.get(t.objeto_ofrecido_id) if t.objeto_ofrecido_id else None
+        user_origen = User.query.get(t.usuario_origen_id)
+        result.append({
+            "id": t.id,
+            "estado": t.estado,
+            "fecha_creacion": t.fecha_creacion.isoformat(),
+            "fecha_cierre": t.fecha_cierre.isoformat() if t.fecha_cierre else None,
+            "objeto_solicitado": serialize_objeto(obj_solicitado),
+            "objeto_ofrecido": serialize_objeto(obj_ofrecido),
+            "usuario_origen": serialize_user(user_origen)
+        })
+    return jsonify(result)
+
+# --- Trueques enviados ---
+@app.route("/trade/sent", methods=["GET"])
+@jwt_required()
+def sent_trades():
+    uid = int(get_jwt_identity())
+    trades = Trueque.query.filter_by(usuario_origen_id=uid).order_by(Trueque.fecha_creacion.desc()).all()
+
+    def serialize_objeto(obj):
+        if not obj:
+            return None
+        return {
+            "id": obj.id,
+            "usuario_id": obj.usuario_id,
+            "fotos": obj.fotos_list(),
+            "titulo": obj.titulo,
+            "descripcion": obj.descripcion,
+            "categoria": obj.categoria,
+            "estado": obj.estado,
+            "fecha_creacion": obj.fecha_creacion.isoformat(),
+            "fecha_ultimo_movimiento": obj.fecha_ultimo_movimiento.isoformat(),
+            "likes": obj.likes
+        }
+
+    result = []
+    for t in trades:
+        obj_solicitado = Objeto.query.get(t.objeto_solicitado_id) if t.objeto_solicitado_id else None
+        obj_ofrecido = Objeto.query.get(t.objeto_ofrecido_id) if t.objeto_ofrecido_id else None
+        user_dest = User.query.get(t.usuario_destino_id)
+        result.append({
+            "id": t.id,
+            "estado": t.estado,
+            "fecha_creacion": t.fecha_creacion.isoformat(),
+            "fecha_cierre": t.fecha_cierre.isoformat() if t.fecha_cierre else None,
+            "objeto_solicitado": serialize_objeto(obj_solicitado),
+            "objeto_ofrecido": serialize_objeto(obj_ofrecido),
+            "usuario_destino": serialize_user(user_dest)
+        })
+    return jsonify(result)
