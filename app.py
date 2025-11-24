@@ -1,4 +1,3 @@
-# app.py
 """
 MVP backend para plataforma de trueques (un solo archivo).
 Tecnologías: Flask, SQLAlchemy (SQLite), Flask-JWT-Extended.
@@ -18,6 +17,7 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from flask_cors import CORS
+from sqlalchemy import and_, func
 
 # --- Configuración básica ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,12 +103,164 @@ class IncentiveHistory(db.Model):
     fecha = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class Auction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    objeto_id = db.Column(db.Integer, db.ForeignKey('objeto.id'), nullable=False)
+    creador_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    precio_inicial = db.Column(db.Integer, nullable=False)
+    precio_actual = db.Column(db.Integer, nullable=False)
+    fecha_inicio = db.Column(db.DateTime, nullable=False)
+    duracion_horas = db.Column(db.Integer, nullable=False)  # 24, 48, 72
+    precio_buy_now = db.Column(db.Integer, nullable=True)
+    estado = db.Column(db.String(20), default='activa')  # activa, finalizada
+    ganador_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    fecha_finalizacion = db.Column(db.DateTime)
+    bids = db.relationship('Bid', backref='auction', lazy=True)
+
+class Bid(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    auction_id = db.Column(db.Integer, db.ForeignKey('auction.id'), nullable=False)
+    usuario_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    monto = db.Column(db.Integer, nullable=False)
+    fecha = db.Column(db.DateTime, default=datetime.utcnow)
+
 class Notification(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     usuario_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     mensaje = db.Column(db.String(500), nullable=False)
     leida = db.Column(db.Boolean, default=False)
     fecha = db.Column(db.DateTime, default=datetime.utcnow)
+
+def serialize_auction(a: Auction):
+    return {
+        "id": a.id,
+        "objeto_id": a.objeto_id,
+        "creador_id": a.creador_id,
+        "precio_inicial": a.precio_inicial,
+        "precio_actual": a.precio_actual,
+        "fecha_inicio": a.fecha_inicio.isoformat(),
+        "duracion_horas": a.duracion_horas,
+        "precio_buy_now": a.precio_buy_now,
+        "estado": a.estado,
+        "ganador_id": a.ganador_id,
+        "fecha_finalizacion": a.fecha_finalizacion.isoformat() if a.fecha_finalizacion else None
+    }
+
+@app.route("/auctions", methods=["POST"])
+@jwt_required()
+def create_auction():
+    uid = int(get_jwt_identity())
+    data = request.json or request.form
+
+    objeto_id = data.get("objeto_id")
+    precio_inicial = int(data.get("precio_inicial", 0))
+    duracion = int(data.get("duracion_horas", 24))
+    fecha_inicio = datetime.fromisoformat(data.get("fecha_inicio")) if data.get("fecha_inicio") else datetime.utcnow()
+    precio_buy_now = int(data["precio_buy_now"]) if data.get("precio_buy_now") else None
+    if not objeto_id or precio_inicial <= 0 or duracion not in (24,48,72):
+        return jsonify({"msg": "Faltan datos obligatorios o valores inválidos"}), 400
+    obj = Objeto.query.get(objeto_id)
+    if not obj or obj.usuario_id != uid:
+        return jsonify({"msg": "Solo puedes subastar tus propios objetos"}), 403
+    a = Auction(
+        objeto_id=objeto_id,
+        creador_id=uid,
+        precio_inicial=precio_inicial,
+        precio_actual=precio_inicial,
+        fecha_inicio=fecha_inicio,
+        duracion_horas=duracion,
+        precio_buy_now=precio_buy_now,
+        estado='activa'
+    )
+    db.session.add(a)
+    db.session.commit()
+    return jsonify({"msg": "Subasta creada", "auction": serialize_auction(a)})
+
+@app.route("/auctions/active", methods=["GET"])
+def list_active_auctions():
+    now = datetime.utcnow()
+    auctions = Auction.query.filter_by(estado='activa').all()
+    out = []
+    for a in auctions:
+        tiempo_restante = (a.fecha_inicio + timedelta(hours=a.duracion_horas)) - now
+        out.append({**serialize_auction(a), "tiempo_restante_segundos": max(0, int(tiempo_restante.total_seconds()))})
+    return jsonify(out)
+
+@app.route("/auctions/<int:auction_id>", methods=["GET"])
+def get_auction(auction_id):
+    a = Auction.query.get_or_404(auction_id)
+    last_bid = Bid.query.filter_by(auction_id=a.id).order_by(Bid.monto.desc()).first()
+    tiempo_restante = (a.fecha_inicio + timedelta(hours=a.duracion_horas)) - datetime.utcnow()
+    return jsonify({
+        **serialize_auction(a),
+        "precio_actual": a.precio_actual,
+        "ultimo_postor_id": last_bid.usuario_id if last_bid else None,
+        "tiempo_restante_segundos": max(0, int(tiempo_restante.total_seconds()))
+    })
+
+@app.route("/auctions/<int:auction_id>/bid", methods=["POST"])
+@jwt_required()
+def make_bid(auction_id):
+    uid = int(get_jwt_identity())
+    a = Auction.query.get_or_404(auction_id)
+    if a.estado != 'activa':
+        return jsonify({"msg": "La subasta no está activa"}), 400
+    data = request.json or request.form
+    monto = int(data.get("monto", 0))
+    if monto <= a.precio_actual:
+        return jsonify({"msg": "La oferta debe ser mayor al precio actual"}), 400
+    user = User.query.get(uid)
+    if user.coins < monto:
+        return jsonify({"msg": "No tienes suficientes coins"}), 400
+    # Devolver coins al anterior postor (si existe)
+    last_bid = Bid.query.filter_by(auction_id=a.id).order_by(Bid.monto.desc()).first()
+    if last_bid:
+        prev_user = User.query.get(last_bid.usuario_id)
+        prev_user.coins += last_bid.monto
+    # Cobrar coins al nuevo postor
+    user.coins -= monto
+    bid = Bid(auction_id=a.id, usuario_id=uid, monto=monto)
+    a.precio_actual = monto
+    db.session.add(bid)
+    db.session.commit()
+    return jsonify({"msg": "Oferta realizada", "bid_id": bid.id})
+
+@app.route("/auctions/<int:auction_id>/result", methods=["GET"])
+def auction_result(auction_id):
+    a = Auction.query.get_or_404(auction_id)
+    if a.estado != 'finalizada':
+        return jsonify({"msg": "La subasta aún no ha finalizado"}), 400
+    winner = User.query.get(a.ganador_id) if a.ganador_id else None
+    return jsonify({
+        "ganador": serialize_user(winner) if winner else None,
+        "precio_final": a.precio_actual,
+        "auction": serialize_auction(a)
+    })
+
+def finalize_auctions():
+    now = datetime.utcnow()
+    auctions = Auction.query.filter_by(estado='activa').all()
+    for a in auctions:
+        end_time = a.fecha_inicio + timedelta(hours=a.duracion_horas)
+        if now >= end_time:
+            # Finalizar subasta
+            a.estado = 'finalizada'
+            a.fecha_finalizacion = end_time
+            last_bid = Bid.query.filter_by(auction_id=a.id).order_by(Bid.monto.desc()).first()
+            if last_bid:
+                a.ganador_id = last_bid.usuario_id
+                # Notificar ganador y creador
+                db.session.add(Notification(usuario_id=a.ganador_id, mensaje=f"¡Felicidades! Ganaste la subasta #{a.id}"))
+                db.session.add(Notification(usuario_id=a.creador_id, mensaje=f"Tu subasta #{a.id} ha finalizado. Ganador: usuario {a.ganador_id}"))
+            else:
+                db.session.add(Notification(usuario_id=a.creador_id, mensaje=f"Tu subasta #{a.id} finalizó sin ofertas."))
+    db.session.commit()
+
+# Endpoint manual para finalizar subastas (puede llamarse por cron o admin)
+@app.route("/auctions/finalize", methods=["POST"])
+def finalize_auctions_route():
+    finalize_auctions()
+    return jsonify({"msg": "Subastas finalizadas (manual run)"})
 
 
 # ONGs / Eventos (página estática)
@@ -171,10 +323,10 @@ def register():
     if User.query.filter_by(email=email).first():
         return jsonify({"msg":"Email ya registrado"}), 400
     pwd_hash = generate_password_hash(password)
-    user = User(nombre=nombre, email=email, password_hash=pwd_hash, ciudad=ciudad, bio=bio)
+    user = User(nombre=nombre, email=email, password_hash=pwd_hash, ciudad=ciudad, bio=bio, coins=100)
     db.session.add(user)
     db.session.commit()
-    # Nota: no asignamos coins hasta que publique un objeto.
+    # Se asignan 100 coins iniciales al crear el usuario.
     return jsonify({"msg":"Usuario creado", "user": serialize_user(user)}), 201
 
 @app.route("/login", methods=["POST"])
@@ -267,6 +419,9 @@ def create_object():
     if len(fotos_files) < 1:
         return jsonify({"msg":"Se requiere al menos 1 foto"}), 400
 
+    if user.coins < 20:
+        return jsonify({"msg": "No tienes suficientes coins para publicar (costo: 20)"}), 400
+
     objeto = Objeto(
         usuario_id = uid,
         fotos = ",".join(fotos_files),
@@ -281,13 +436,10 @@ def create_object():
     db.session.add(objeto)
     db.session.commit()
 
-    # Incentivos: +20 coins por publicar
-    user.coins += 20
-    db.session.add(IncentiveHistory(usuario_id=uid, tipo_incentivo="coins", valor="+20"))
-    # +50 si publica dentro de primeras 24h del registro
-    if datetime.utcnow() - user.fecha_registro <= timedelta(hours=24):
-        user.coins += 50
-        db.session.add(IncentiveHistory(usuario_id=uid, tipo_incentivo="coins", valor="+50 (bonus 24h)"))
+    # Costo por publicar: -20 coins
+    user.coins -= 20
+    db.session.add(IncentiveHistory(usuario_id=uid, tipo_incentivo="fee", valor="-20 (publicación)"))
+
     # regla: si publica 5+ objetos en un día -> se guarda un record (incentive) para aplicar descuento al gastar
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     count_today = Objeto.query.filter(Objeto.usuario_id==uid, Objeto.fecha_creacion >= today_start).count()
@@ -484,6 +636,15 @@ def finalize_trade(trade_id):
         u2.ranking_score = (u2.ranking_score or 0) + 1
     db.session.add(IncentiveHistory(usuario_id=u1.id, tipo_incentivo="ranking", valor="+1") if u1 else None)
     db.session.add(IncentiveHistory(usuario_id=u2.id, tipo_incentivo="ranking", valor="+1") if u2 else None)
+    
+    # Recompensa por trueque finalizado: +50 coins
+    if u1:
+        u1.coins += 50
+        db.session.add(IncentiveHistory(usuario_id=u1.id, tipo_incentivo="coins", valor="+50 (trueque finalizado)"))
+    if u2:
+        u2.coins += 50
+        db.session.add(IncentiveHistory(usuario_id=u2.id, tipo_incentivo="coins", valor="+50 (trueque finalizado)"))
+
     # badges: Eco-Warrior: si tiene 3+ intercambios completados
     for u in (u1,u2):
         if u and u.ranking_score >= 3:
@@ -735,6 +896,30 @@ def spend_coins():
     db.session.add(IncentiveHistory(usuario_id=uid, tipo_incentivo="coins", valor=f"-{final_amount}"))
     db.session.commit()
     return jsonify({"msg":"Coins gastados", "final_amount": final_amount, "discount_applied": discount>0})
+
+# --- Objetos del usuario autenticado ---
+@app.route("/my/objects", methods=["GET", "OPTIONS"])
+@jwt_required(optional=True)
+def my_objects():
+    if request.method == "OPTIONS":
+        return '', 204
+    uid = int(get_jwt_identity())
+    if not uid:
+        return jsonify({"msg": "No autenticado"}), 401
+    objs = Objeto.query.filter_by(usuario_id=uid, visible=True).all()
+    def ser(o):
+        return {
+            "id": o.id,
+            "titulo": o.titulo,
+            "descripcion": o.descripcion,
+            "categoria": o.categoria,
+            "estado": o.estado,
+            "fotos": o.fotos_list(),
+            "fecha_creacion": o.fecha_creacion.isoformat(),
+            "fecha_ultimo_movimiento": o.fecha_ultimo_movimiento.isoformat(),
+            "likes": o.likes
+        }
+    return jsonify([ser(o) for o in objs])
 
 # --- Inicialización DB (ruta útil para primera ejecución) ---
 @app.route("/init_db", methods=["POST"])
